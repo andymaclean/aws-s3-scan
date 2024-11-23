@@ -65,18 +65,18 @@ type OneKeyStats struct {
 	NumHistDeleteMarkers int64
 	NumVersions int64
 
-	age int
+	IsOld bool
 
 	Size int64
 	DuplicateSize int64
 	ETags map[*string]int
 }
 
-func (ks *OneKeyStats) handleDeleteMarker(dm *s3types.DeleteMarkerEntry, age int) {
+func (ks *OneKeyStats) handleDeleteMarker(dm *s3types.DeleteMarkerEntry, isOld bool) {
 	if *dm.IsLatest {
 		ks.IsDeleted = true
 		ks.NoCurrent = false
-		ks.age = age
+		ks.IsOld = isOld
 	} else {
 		ks.NumHistDeleteMarkers ++;
 	}
@@ -84,14 +84,15 @@ func (ks *OneKeyStats) handleDeleteMarker(dm *s3types.DeleteMarkerEntry, age int
 	ks.NumDeleteMarkers ++;	
 }
 
-func (ks *OneKeyStats) handleObjectVersion(ov *s3types.ObjectVersion, age int) {
+func (ks *OneKeyStats) handleObjectVersion(ov *s3types.ObjectVersion, isOld bool) {
 	if _, ok := ks.ETags[ov.ETag] ; ok {
 		ks.ETags[ov.ETag] ++
 		ks.DuplicateSize += *ov.Size
-		ks.age = age
 	} else {
 		ks.ETags[ov.ETag] = 1
 	}
+
+	ks.IsOld = isOld
 
 	if *ov.IsLatest {
 		ks.IsDeleted = false
@@ -127,12 +128,12 @@ func (ksm *KeyStatMap) getKeyStats(key *string) (*OneKeyStats) {
 	return s
 }
 
-func (ksm *KeyStatMap) handleDeleteMarker(dm *s3types.DeleteMarkerEntry, age int) {
-	ksm.getKeyStats(dm.Key).handleDeleteMarker(dm, age)
+func (ksm *KeyStatMap) handleDeleteMarker(dm *s3types.DeleteMarkerEntry, isOld bool) {
+	ksm.getKeyStats(dm.Key).handleDeleteMarker(dm, isOld)
 }
 
-func (ksm *KeyStatMap) handleObjectVersion(ov *s3types.ObjectVersion, age int) {
-	ksm.getKeyStats(ov.Key).handleObjectVersion(ov, age)
+func (ksm *KeyStatMap) handleObjectVersion(ov *s3types.ObjectVersion, isOld bool) {
+	ksm.getKeyStats(ov.Key).handleObjectVersion(ov, isOld)
 }
 
 
@@ -173,19 +174,19 @@ type AllKeyStats struct {
 }
 
 
-func (aks *AllKeyStats) includeDeleteMarker (dm *s3types.DeleteMarkerEntry, age int) {
+func (aks *AllKeyStats) includeDeleteMarker (dm *s3types.DeleteMarkerEntry, isOld bool) {
 	aks.NumDeleteMarkers ++
 	if *dm.IsLatest {
 		aks.NumCurrentDeleteMarkers ++
 	} else {
 		aks.NumHistDeleteMarkers ++
 	}
-	if age > 7 {
+	if isOld {
 		aks.NumOldDeleteMarkers ++
 	}
 }
 
-func (aks *AllKeyStats) includeObjectVersion (ov *s3types.ObjectVersion, age int) {
+func (aks *AllKeyStats) includeObjectVersion (ov *s3types.ObjectVersion, isOld bool) {
 	aks.NumVersions ++
 	if *ov.IsLatest {
 		aks.NumCurrentVersions ++
@@ -193,7 +194,7 @@ func (aks *AllKeyStats) includeObjectVersion (ov *s3types.ObjectVersion, age int
 	} else {
 		aks.DeletedVersionBytes += *ov.Size
 	}
-	if age > 7 {
+	if isOld {
 		aks.NumOldVersions ++
 		aks.OldVersionBytes += *ov.Size
 	}
@@ -224,7 +225,7 @@ func (aks *AllKeyStats) includeOneKeyStats (ks *OneKeyStats) {
 		aks.BiggestMultiverFileVersions = ks.NumVersions
 	}
 
-	if ks.age > 7  {
+	if ks.IsOld  {
 		if ks.IsDeleted {
 			aks.NumOldDeletedObjects ++
 			aks.OldDeletedObjectBytes += ks.Size
@@ -330,7 +331,7 @@ type taskStatus struct {
 
 
 
-func getObjectVersionStats(config *aws.Config, bucketPtr *string, prefixPtr *string, timeNow time.Time, notificationChan chan <- taskStatus) (*AllKeyStats){
+func getObjectVersionStats(config *aws.Config, bucketPtr *string, prefixPtr *string, timeNow time.Time, notificationChan chan <- taskStatus, oldAge *int) (*AllKeyStats){
 	client := s3.NewFromConfig(*config)
 	var keyMarker *string
 	var versionIdMarker *string
@@ -359,16 +360,16 @@ func getObjectVersionStats(config *aws.Config, bucketPtr *string, prefixPtr *str
 		
 		for _, dm := range output.DeleteMarkers {
 			dmProcessed ++;
-			age := int(timeNow.Sub(*dm.LastModified).Hours() / 24)
-			aks.includeDeleteMarker(&dm, age)
-			ksm.handleDeleteMarker (&dm, age)
+			isOld := int(timeNow.Sub(*dm.LastModified).Hours() / 24) > *oldAge
+			aks.includeDeleteMarker(&dm, isOld)
+			ksm.handleDeleteMarker (&dm, isOld)
 		}
 
 		for _, ov := range output.Versions {
 			oProcessed ++
-			age := int(timeNow.Sub(*ov.LastModified).Hours() / 24)
-			aks.includeObjectVersion(&ov, age)
-			ksm.handleObjectVersion (&ov, age)
+			isOld := int(timeNow.Sub(*ov.LastModified).Hours() / 24) > *oldAge
+			aks.includeObjectVersion(&ov, isOld)
+			ksm.handleObjectVersion (&ov, isOld)
 		}
 
 		if oProcessed - oOutput > 10000 {
@@ -409,6 +410,7 @@ func main () {
 	prefixPtr := flag.String("prefix", "", "Bucket Prefix")
 
 	numThreads := flag.Int("threads", 100, "Number of threads")
+	oldAge := flag.Int("oldage", 7, "Files older than this many days considered old")
 	pfMult := flag.Bool("pfmult", false, "Multiply prefixes by [0-9a-f]")
 
 	flag.Parse()
@@ -416,6 +418,8 @@ func main () {
 	log.Println("Bucket: ", *bucketPtr)
 	log.Println("Prefix: ", *prefixPtr)
 	log.Println("Threads: ", *numThreads)
+	log.Println("Old Age: ", *oldAge)
+	log.Println("Pfmult: ", *pfMult)
 
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
@@ -486,7 +490,7 @@ func main () {
 				} else {
 					//log.Printf("Thread %d working on prefix %s", myThread, *nextPrefix)
 
-					results <- getObjectVersionStats(&cfg, bucketPtr, nextPrefix, timeNow, notificationChan)
+					results <- getObjectVersionStats(&cfg, bucketPtr, nextPrefix, timeNow, notificationChan, oldAge)
 					//log.Printf("Thread %d done with prefix %s", myThread, *nextPrefix)
 				}
 			}
